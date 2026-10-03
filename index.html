@@ -182,10 +182,11 @@ input[type=range]{accent-color:var(--ink);height:20px}
   <p class="foot">Simplified single-scattering atmosphere at 10 nm steps (Rayleigh, Ångström aerosol, Chappuis ozone, H₂O and O₂ bands, cloud diffusion), converted with CIE 1931 colour matching. Built for side-by-side comparison, not calibrated colour grading. Clock times are standard time (no daylight saving).</p>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
-<script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 (() => {
 const rad = Math.PI / 180;
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
@@ -389,7 +390,8 @@ void main(){
   c+=glow*(pow(s,6.)*0.6+pow(s,48.)*1.2)*smoothstep(-0.06,0.02,h);
   c+=disc*smoothstep(0.99990,0.99996,s)*step(0.,h)*(1.-bld);
   if(display>0.5) c=aces(c);
-  gl_FragColor=linearToOutputTexel(vec4(c,1.));
+  gl_FragColor=vec4(c,1.);
+  #include <colorspace_fragment>
 }`;
 const SKY_VERT = `varying vec3 vDir; void main(){ vec4 wp=modelMatrix*vec4(position,1.); vDir=wp.xyz-cameraPosition; gl_Position=projectionMatrix*viewMatrix*wp; }`;
 const skyMat = display => new THREE.ShaderMaterial({
@@ -399,7 +401,7 @@ const skyMat = display => new THREE.ShaderMaterial({
     exposure:{value:1}, haze:{value:0}, display:{value:display ? 1 : 0}},
   vertexShader: SKY_VERT, fragmentShader: SKY_FRAG,
 });
-const linColor = hex => new THREE.Color(hex).convertSRGBToLinear();
+const linColor = hex => new THREE.Color(hex);
 
 /* ---------- automotive paint ----------
    Layer stack, bottom to top: base coat (colour that shifts face → flop with viewing angle),
@@ -433,38 +435,72 @@ function peelTexture(){
   g.putImageData(img, 0, 0);
   const tex = new THREE.CanvasTexture(cv); tex.wrapS = tex.wrapT = THREE.RepeatWrapping; return tex;
 }
-const FLAKES = flakeTexture(), PEEL = peelTexture();
-const PAINT_U = {faceCol:{value:new THREE.Color(1,0,0)}, flopCol:{value:new THREE.Color(.5,0,0)}, flopExp:{value:1}};
+function tyreTexture(){
+  const S = 512, h = new Float32Array(S*S), cv = document.createElement('canvas'); cv.width = cv.height = S;
+  for (let i = 0; i < S*S; i++) h[i] = Math.random() + Math.random();
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) h[y*S+x] += .5*Math.sin(2*Math.PI*y*14/S) + .25*Math.sin(2*Math.PI*(x*3+y*5)/S + 1) + (y%64 < 3 ? 1.2 : 0);
+  const g = cv.getContext('2d'), img = g.createImageData(S, S), d = img.data;
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++){
+    const nx = (h[y*S+(x+S-1)%S] - h[y*S+(x+1)%S])*.5, ny = (h[((y+S-1)%S)*S+x] - h[((y+1)%S)*S+x])*.5, l = Math.hypot(nx, ny, 1), i = (y*S+x)*4;
+    d[i] = (nx/l*.5+.5)*255; d[i+1] = (ny/l*.5+.5)*255; d[i+2] = (1/l*.5+.5)*255; d[i+3] = 255; }
+  g.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cv); tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.anisotropy = 4; tex.repeat.set(8, 8); return tex;
+}
+const FLAKES = flakeTexture(), PEEL = peelTexture(), TYRE = tyreTexture();
+// flakes: per-cell hashed micro-mirrors in panel space (~14 mm cells), sharp specular lobe toward the sun, faded by pixel footprint so they never alias
+const FLAKE_GLSL = `
+uniform vec3 faceCol, flopCol; uniform float flopExp, flakeAmt, flakeTint, deep;
+vec3 h33(vec3 p){ p = fract(p*vec3(.1031,.1030,.0973)); p += dot(p, p.yxz+33.33); return fract((p.xxy+p.yxx)*p.zyx); }
+vec3 flakeGlint(vec3 N, vec3 V, vec3 L, vec3 Lc, vec2 uv, float fw, vec3 fc){
+  if(flakeAmt <= 0.) return vec3(0.);
+  vec3 H = normalize(L+V); float a = acos(min(dot(N,H), 1.)), nl = clamp(dot(N,L)*4.,0.,1.);
+  // dense micro-flakes: many per pixel, so the lit fraction is the flake-normal spread around the highlight; hashed grain only resolves up close
+  float stat = exp(-a*a/.0512)*.8 + exp(-a*a/.0072)*.7, mod = 1., seed = floor(dot(H, vec3(31.,17.,23.)));
+  for(int k=0;k<2;k++){
+    float sc = k==0 ? 90. : 520.; vec2 p = (k==0 ? uv : mat2(.8,-.6,.6,.8)*uv)*sc;
+    float fade = 1. - smoothstep(.5, 1.2, fw*sc), r = h33(vec3(floor(p), seed + float(k)*5.)).x;
+    mod *= mix(1., r < .35 ? 2.7 : .1, fade);
+  }
+  return Lc*fc*stat*mod*nl*flakeAmt*.75;
+}`;
+const FLAKE_DIR = 'RE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );';
+const PAINT_U = {faceCol:{value:new THREE.Color(1,0,0)}, flopCol:{value:new THREE.Color(.5,0,0)}, flopExp:{value:1}, flakeAmt:{value:0}, flakeTint:{value:0}, deep:{value:0}};
 function makePaint(){
-  const m = new THREE.MeshPhysicalMaterial({color:0xffffff, roughness:.3, metalness:.5, clearcoat:1, clearcoatRoughness:.03,
+  const m = new THREE.MeshPhysicalMaterial({color:0xffffff, roughness:.3, metalness:.5, clearcoat:1, clearcoatRoughness:.03, ior:1.5,
     normalMap:FLAKES, normalScale:new THREE.Vector2(.5,.5), clearcoatNormalMap:PEEL, clearcoatNormalScale:new THREE.Vector2(.1,.1)});
   m.onBeforeCompile = sh => {
     Object.assign(sh.uniforms, PAINT_U);
-    sh.fragmentShader = 'uniform vec3 faceCol, flopCol; uniform float flopExp;\n' + sh.fragmentShader.replace('#include <normal_fragment_maps>',
+    const lfb = THREE.ShaderChunk.lights_fragment_begin, at = lfb.indexOf(FLAKE_DIR, lfb.indexOf('NUM_DIR_LIGHTS')) + FLAKE_DIR.length;
+    const lights = lfb.slice(0, at) + `\n#if UNROLLED_LOOP_INDEX == 0\nreflectedLight.directSpecular += flakeGlint(nonPerturbedNormal, geometryViewDir, directLight.direction, directLight.color, vNormalMapUv, flakeFw, flakeCol);\n#endif` + lfb.slice(at);
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\n' + FLAKE_GLSL).replace('#include <lights_fragment_begin>', lights).replace('#include <normal_fragment_maps>',
       `#include <normal_fragment_maps>
-      { float ndv = clamp(dot(geometryNormal, normalize(vViewPosition)), 0., 1.);
-        diffuseColor.rgb = mix(flopCol, faceCol, pow(ndv, flopExp)); }`);
+      float flakeFw = max(fwidth(vNormalMapUv).x, fwidth(vNormalMapUv).y);
+      float ndv = clamp(dot(nonPerturbedNormal, normalize(vViewPosition)), 0., 1.);
+      vec3 flakeCol = mix(vec3(1.), faceCol/max(max(faceCol.r, faceCol.g), max(faceCol.b, .05)), flakeTint);
+      { vec3 c = mix(flopCol, faceCol, pow(ndv, flopExp));
+        c *= exp(-deep*(1./max(ndv, .3) - 1.)*(1. - clamp(faceCol/max(max(faceCol.r, faceCol.g), max(faceCol.b, .05)), 0., 1.))*.8);
+        diffuseColor.rgb = c; }`);
   };
   return m;
 }
-// finish recipes: base roughness/metalness is the flake layer, clearcoat sits on top
+// finish recipes: base roughness/metalness is the flake layer, clearcoat sits on top; sparkle = glint strength, irid / aniso need a recompile when toggled
 const FIN = {
-  solid:    {n:'Solid',    metalness:0,   roughness:.42, clearcoat:1, clearcoatRoughness:.03, flake:0,   peel:.12, exp:.9},
-  metallic: {n:'Metallic', metalness:.6,  roughness:.3,  clearcoat:1, clearcoatRoughness:.03, flake:.55, peel:.12, exp:1.1},
-  pearl:    {n:'Pearl',    metalness:.3,  roughness:.34, clearcoat:1, clearcoatRoughness:.03, flake:.3,  peel:.12, exp:.9},
-  candy:    {n:'Candy',    metalness:.5,  roughness:.26, clearcoat:1, clearcoatRoughness:.02, flake:.4,  peel:.1,  exp:1.6},
-  matte:    {n:'Satin',    metalness:.35, roughness:.55, clearcoat:1, clearcoatRoughness:.5,  flake:.2,  peel:0,   exp:1},
+  solid:    {n:'Solid',    metalness:0,   roughness:.42, clearcoat:1, clearcoatRoughness:.03, flake:0,   peel:.12, exp:.9,  sparkle:0,   irid:0,   aniso:0,   deep:0, tint:0},
+  metallic: {n:'Metallic', metalness:.65, roughness:.32, clearcoat:1, clearcoatRoughness:.03, flake:.35, peel:.12, exp:1.1, sparkle:1,   irid:0,   aniso:.15, deep:0, tint:0.12},
+  pearl:    {n:'Pearl',    metalness:.3,  roughness:.34, clearcoat:1, clearcoatRoughness:.03, flake:.2,  peel:.12, exp:.9,  sparkle:.65, irid:.4,  aniso:0,   deep:0, tint:0.6},
+  candy:    {n:'Candy',    metalness:.5,  roughness:.26, clearcoat:1, clearcoatRoughness:.02, flake:.25, peel:.1,  exp:1.6, sparkle:.8,  irid:0,   aniso:0,   deep:1, tint:0.9},
+  matte:    {n:'Satin',    metalness:.35, roughness:.55, clearcoat:1, clearcoatRoughness:.5,  flake:.15, peel:0,   exp:1,   sparkle:.2,  irid:0,   aniso:0,   deep:0, tint:0.12},
 };
 function paintLook(hex, type){
-  const hsl = {}; new THREE.Color(hex).getHSL(hsl);
+  const hsl = {}; new THREE.Color(hex).getHSL(hsl, THREE.SRGBColorSpace);
   const face = new THREE.Color(hex), flop = new THREE.Color();
   const {h, s, l} = hsl;
-  if (type === 'solid') flop.setHSL(h, s, l*.86);
-  else if (type === 'metallic'){ face.setHSL(h, s*.92, Math.min(.95, l*1.12)); flop.setHSL(h, Math.min(1, s*1.1), l*.32); }
-  else if (type === 'pearl'){ if (s < .15) flop.setHSL(.11, .3, l*.84); else flop.setHSL((h+.09)%1, Math.min(1, s*1.15+.05), l*.58); }
-  else if (type === 'candy'){ face.setHSL(h, Math.min(1, s*1.05), Math.min(.9, l*1.1)); flop.setHSL(h, Math.min(1, s*1.25), l*.22); }
-  else flop.setHSL(h, s, l*.92);
-  return {face: face.convertSRGBToLinear(), flop: flop.convertSRGBToLinear()};
+  if (type === 'solid') flop.setHSL(h, s, l*.86, THREE.SRGBColorSpace);
+  else if (type === 'metallic'){ face.setHSL(h, s*.92, Math.min(.95, l*1.12), THREE.SRGBColorSpace); flop.setHSL(h, Math.min(1, s*1.1), l*.32, THREE.SRGBColorSpace); }
+  else if (type === 'pearl'){ if (s < .15) flop.setHSL(.11, .3, l*.84, THREE.SRGBColorSpace); else flop.setHSL((h+.09)%1, Math.min(1, s*1.15+.05), l*.58, THREE.SRGBColorSpace); }
+  else if (type === 'candy'){ face.setHSL(h, Math.min(1, s*1.05), Math.min(.9, l*1.1), THREE.SRGBColorSpace); flop.setHSL(h, Math.min(1, s*1.25), l*.22, THREE.SRGBColorSpace); }
+  else flop.setHSL(h, s, l*.92, THREE.SRGBColorSpace);
+  return {face, flop};
 }
 
 /* body: lofted super-ellipse sections, so highlights and horizon reflections flow across curved panels */
@@ -494,14 +530,17 @@ function loftBody(){
   return geo;
 }
 
+// car glass: dark tinted dielectric, IOR 1.5, clean reflections, slightly see-through (no transmission pass)
+const glassMat = (color, opacity = .88) => new THREE.MeshPhysicalMaterial({color, roughness:.02, metalness:0, ior:1.5, clearcoat:1, clearcoatRoughness:.01, envMapIntensity:2, transparent:true, opacity});
+const rubberize = m => { m.roughness = .88; m.metalness = 0; m.normalMap = TYRE; m.normalScale = new THREE.Vector2(.6,.6); m.envMapIntensity = .5; m.needsUpdate = true; return m; };
 function buildCar(paint){
   const car = new THREE.Group();
-  const glass = new THREE.MeshPhysicalMaterial({color:0x07090c, roughness:.04, metalness:0, clearcoat:1, clearcoatRoughness:.02});
+  const glass = glassMat(0x07090c, .9);
   const trim = new THREE.MeshPhysicalMaterial({color:linColor('#111214'), roughness:.35, clearcoat:.6, clearcoatRoughness:.1});
   const well = new THREE.MeshStandardMaterial({color:linColor('#0b0b0c'), roughness:.95});
-  const tyre = new THREE.MeshStandardMaterial({color:linColor('#151515'), roughness:.92});
-  const rim = new THREE.MeshStandardMaterial({color:0xbfc3c8, metalness:1, roughness:.28});
-  const chrome = new THREE.MeshStandardMaterial({color:0xffffff, metalness:1, roughness:.08});
+  const tyre = rubberize(new THREE.MeshStandardMaterial({color:linColor('#151515')}));
+  const rim = new THREE.MeshStandardMaterial({color:0xd0d3d8, metalness:1, roughness:.22});
+  const chrome = new THREE.MeshStandardMaterial({color:0xffffff, metalness:1, roughness:.05});
   const plate = new THREE.MeshStandardMaterial({color:linColor('#e9e7df'), roughness:.6});
   const body = new THREE.Mesh(loftBody(), paint); body.castShadow = body.receiveShadow = true; car.add(body);
   car.updateMatrixWorld(true);
@@ -531,14 +570,15 @@ function buildCar(paint){
     stick(B(.46,.13,.06), chrome, sd*.55, .66, 0);
     stick(B(.42,.1,.05), lens, sd*.55, .665, .018);
     stick(B(.38,.022,.04), drl, sd*.56, .585, .012);
-    const sp = new THREE.SpotLight(0xffffff, 0, 30, .42, .55, 1);
+    const sp = new THREE.SpotLight(0xffffff, 0, 30, .42, .55, 2);
     sp.position.set(sd*.55,.66,2.3); sp.target.position.set(sd*.35,0,13);
     car.add(sp, sp.target); spots.push(sp);
     const mir = new THREE.Mesh(B(.2,.11,.09), paint); mir.position.set(sd*.87,.93,.9); mir.castShadow = true; car.add(mir);
   });
   [1.38, -1.45].forEach(z => [-1,1].forEach(sd => {
     const w = new THREE.Mesh(new THREE.CylinderGeometry(.44,.44,.24,40), well); w.rotation.z = Math.PI/2; w.position.set(sd*.85,.36,z); car.add(w);
-    const t = new THREE.Mesh(new THREE.CylinderGeometry(.36,.36,.26,36), tyre); t.rotation.z = Math.PI/2; t.position.set(sd*.87,.36,z); t.castShadow = true; car.add(t);
+    const tg = new THREE.CylinderGeometry(.36,.36,.26,36); tg.attributes.uv.array.forEach((v, i, a) => a[i] = v*2.3);
+    const t = new THREE.Mesh(tg, tyre); t.rotation.z = Math.PI/2; t.position.set(sd*.87,.36,z); t.castShadow = true; car.add(t);
     const r = new THREE.Mesh(new THREE.CylinderGeometry(.23,.23,.02,28), rim); r.rotation.z = Math.PI/2; r.position.set(sd*1.005,.36,z); car.add(r);
   }));
   return {car, lens, drl, spots};
@@ -581,33 +621,53 @@ function prepareModel(root){
     if (m.transparent || m.opacity < .98 || /glass|rubber|tyre|tire|chrome|black|graphite|trim/i.test(m.name || '') || lum < .05) return;
     if (v > best){ best = v; paint = m; }
   });
+  // glass, rubber and metal: swap in realistic materials (matched by name, transparency, or position on the wheels)
+  const H = new THREE.Box3().setFromObject(root), hh = H.max.y - H.min.y, swap = new Map(), box = new THREE.Box3();
+  const lumOf = m => .2126*m.color.r + .7152*m.color.g + .0722*m.color.b;
+  const meshes = []; root.traverse(o => { if (o.isMesh && !Array.isArray(o.material) && o.material !== paint){ box.setFromObject(o); o.userData.wheel = box.max.y - H.min.y < .5*hh && box.min.y - H.min.y < .12*hh; meshes.push(o); } });
+  const wheelOnly = new Map(); meshes.forEach(o => wheelOnly.set(o.material, (wheelOnly.get(o.material) ?? true) && o.userData.wheel));
+  wheelOnly.forEach((wheel, m) => {
+    const n = m.name || '', lum = lumOf(m);
+    if (/glass|windscreen|windshield/i.test(n) || (m.transparent || m.opacity < .98) && lum < .1 && !/lamp|lens|light/i.test(n)){
+      const c = m.color.clone(); if (lum > .05) c.multiplyScalar(.05/lum);
+      swap.set(m, glassMat(c, clamp(m.opacity < 1 ? m.opacity : .9, .6, .92)));
+    } else if (/lamp|lens|light/i.test(n) || m.transparent || m.opacity < .98){
+      const pale = lum > .25 && Math.max(m.color.r, m.color.g, m.color.b) - Math.min(m.color.r, m.color.g, m.color.b) < .25*Math.max(m.color.r, m.color.g, m.color.b);
+      swap.set(m, pale ? glassMat(m.color.clone().multiplyScalar(.05/lum), .6) : glassMat(m.color.clone(), clamp(m.opacity, .55, .92)));
+    } else if (/rubber|tyre|tire/i.test(n) || wheel && lum < .03) swap.set(m, rubberize(m));
+    else if (/chrome/i.test(n)){ m.metalness = 1; m.roughness = Math.min(m.roughness, .06); }
+    else if (/rim|alloy|wheel/i.test(n) || wheel && lum >= .03){ m.metalness = 1; m.roughness = Math.min(m.roughness, .25); }
+  });
+  meshes.forEach(o => { const m = swap.get(o.material); if (m){ o.material = m; if (m.normalMap === TYRE) planarUV(o.geometry); } });
   // planar UVs in metres on painted meshes so flakes and orange peel have a scale
   root.traverse(o => {
     if (!o.isMesh || !paint) return;
     if (!(Array.isArray(o.material) ? o.material.includes(paint) : o.material === paint)) return;
-    const g = o.geometry; if (!g.attributes.normal) g.computeVertexNormals();
-    const P = g.attributes.position, Nn = g.attributes.normal, uv = new Float32Array(P.count*2);
-    for (let i = 0; i < P.count; i++){
-      const nx = Math.abs(Nn.getX(i)), ny = Math.abs(Nn.getY(i)), nz = Math.abs(Nn.getZ(i));
-      const [u, v] = nx >= ny && nx >= nz ? [P.getZ(i), P.getY(i)] : ny >= nz ? [P.getX(i), P.getZ(i)] : [P.getX(i), P.getY(i)];
-      uv[i*2] = u; uv[i*2+1] = v;
-    }
-    g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    planarUV(o.geometry);
   });
-  const box = new THREE.Box3().setFromObject(root);
-  return {root, paint, box};
+  return {root, paint, box: new THREE.Box3().setFromObject(root)};
+}
+function planarUV(g){
+  if (!g.attributes.normal) g.computeVertexNormals();
+  const P = g.attributes.position, Nn = g.attributes.normal, uv = new Float32Array(P.count*2);
+  for (let i = 0; i < P.count; i++){
+    const nx = Math.abs(Nn.getX(i)), ny = Math.abs(Nn.getY(i)), nz = Math.abs(Nn.getZ(i));
+    const [u, v] = nx >= ny && nx >= nz ? [P.getZ(i), P.getY(i)] : ny >= nz ? [P.getX(i), P.getZ(i)] : [P.getX(i), P.getY(i)];
+    uv[i*2] = u; uv[i*2+1] = v;
+  }
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
 }
 function loadModel(key, onProgress){
   const M = MODELS[key];
   // .glb loads directly; .b64.txt is the same model as base64 text (for hosts that only serve text)
   if (!modelCache[key] && /\.glb$/i.test(M.file)) modelCache[key] = new Promise((res, rej) =>
-    new THREE.GLTFLoader().load(M.file, g => res(prepareModel(g.scene)), onProgress, rej));
+    new GLTFLoader().load(M.file, g => res(prepareModel(g.scene)), onProgress, rej));
   if (!modelCache[key]) modelCache[key] = new Promise((res, rej) => {
     const fl = new THREE.FileLoader(); fl.setResponseType('text');
     fl.load(M.file, txt => {
       const bin = atob(txt.replace(/\s+/g, '')), buf = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-      new THREE.GLTFLoader().parse(buf.buffer, '', g => res(prepareModel(g.scene)), rej);
+      new GLTFLoader().parse(buf.buffer, '', g => res(prepareModel(g.scene)), rej);
     }, onProgress, rej);
   });
   return modelCache[key];
@@ -669,14 +729,14 @@ function makeBench(key, init){
   const view = el.querySelector('.view');
   const renderer = new THREE.WebGLRenderer({antialias:true});
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-  renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   view.prepend(renderer.domElement);
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(32, 1.6, .1, 1500);
   camera.position.set(3.4, 1.45, 7.4);
-  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  const controls = new OrbitControls(camera, renderer.domElement);
   controls.target.set(0, .75, .3); controls.minDistance = 3.5; controls.maxDistance = 20; controls.maxPolarAngle = 1.53;
   controls.update();
 
@@ -703,7 +763,7 @@ function makeBench(key, init){
 
   const sun = new THREE.DirectionalLight(0xffffff, 1);
   sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
-  Object.assign(sun.shadow.camera, {left:-6, right:6, top:6, bottom:-6, near:1, far:80});
+  Object.assign(sun.shadow.camera, {left:-6, right:6, top:6, bottom:-6, near:1, far:80}); sun.shadow.camera.updateProjectionMatrix();
   sun.shadow.bias = -.0004; sun.shadow.normalBias = .02;
   scene.add(sun, sun.target);
 
@@ -713,7 +773,7 @@ function makeBench(key, init){
   const arm = new THREE.Mesh(new THREE.BoxGeometry(2.2,.06,.06), poleMat); arm.position.set(1.55,5.95,-.6);
   const headMat = new THREE.MeshStandardMaterial({color:0x111111, emissive:0xffffff, emissiveIntensity:0});
   const head = new THREE.Mesh(new THREE.BoxGeometry(.55,.08,.26), headMat); head.position.set(.5,5.9,-.6);
-  const streetL = new THREE.PointLight(0xffffff, 0, 30, 1); streetL.position.set(.5,5.7,-.6);
+  const streetL = new THREE.PointLight(0xffffff, 0, 30, 2); streetL.position.set(.5,5.7,-.6);
   lamp.add(pole, arm, head, streetL); scene.add(lamp);
 
   const vec = a => new THREE.Vector3(a[0], a[1], a[2]);
@@ -725,7 +785,7 @@ function makeBench(key, init){
     const {az, el: e} = r.sp;
     const sd = new THREE.Vector3(Math.sin(az*rad)*Math.cos(e*rad), Math.sin(e*rad), -Math.cos(az*rad)*Math.cos(e*rad));
     holder.rotation.y = -(c.heading - 180)*rad; // 180° = facing south (+Z)
-    sun.position.copy(sd).multiplyScalar(40); sun.color.setRGB(...r.sunCol); sun.intensity = e > -1 ? r.sunI : 0;
+    sun.position.copy(sd).multiplyScalar(40); sun.color.setRGB(...r.sunCol); sun.intensity = e > -1 ? r.sunI*Math.PI : 0;
     const strength = WEATHER[c.weather].c;
     sun.castShadow = strength < 1 && e > 0;
 
@@ -747,7 +807,7 @@ function makeBench(key, init){
     ground.material.color.copy(linColor(W.wet ? '#1f2023' : '#303134'));
 
     lamp.visible = c.street !== 'none';
-    streetL.color.setRGB(...r.streetCol); streetL.intensity = r.streetI/.8;
+    streetL.color.setRGB(...r.streetCol); streetL.intensity = r.streetI/.8*Math.PI*36;
     headMat.emissive.setRGB(...r.streetCol); headMat.emissiveIntensity = r.streetI*600;
 
     const H = HEAD[c.head];
@@ -755,7 +815,7 @@ function makeBench(key, init){
     const hm = Math.max(...hc);
     lens.emissive.setRGB(...hc.map(v => v/hm)); lens.emissiveIntensity = H.spec ? 1.6 : 0;
     drl.emissive.setRGB(...hc.map(v => v/hm)); drl.emissiveIntensity = H.spec ? 1.2 : .05;
-    spots.forEach(s => { s.color.setRGB(...hc); s.intensity = H.spec ? 3*250/110000*6 : 0; });
+    spots.forEach(s => { s.color.setRGB(...hc); s.intensity = H.spec ? 3*250/110000*6*Math.PI*32 : 0; });
 
     const expo = document.getElementById('expo').value === 'adapt' ? clamp(.85/Math.pow(Math.max(r.rel,1e-9), .75), .4, 4000) : .85;
     renderer.toneMappingExposure = expo; sky.material.uniforms.exposure.value = expo;
@@ -820,17 +880,18 @@ const benches = [A, Bb];
 
 function applyPaint(){
   const F = FIN[finish], look = paintLook(paintHex, finish);
-  PAINT_U.faceCol.value.copy(look.face); PAINT_U.flopCol.value.copy(look.flop); PAINT_U.flopExp.value = F.exp;
+  PAINT_U.faceCol.value.copy(look.face); PAINT_U.flopCol.value.copy(look.flop); PAINT_U.flopExp.value = F.exp; PAINT_U.flakeAmt.value = F.sparkle; PAINT_U.deep.value = F.deep; PAINT_U.flakeTint.value = F.tint;
   document.getElementById('finish').value = finish;
   benches.forEach(b => {
-    Object.assign(b.paint, {metalness:F.metalness, roughness:F.roughness, clearcoat:F.clearcoat, clearcoatRoughness:F.clearcoatRoughness});
+    const p = b.paint; if ((p.iridescence > 0) !== (F.irid > 0) || (p.anisotropy > 0) !== (F.aniso > 0)) p.needsUpdate = true;
+    Object.assign(p, {metalness:F.metalness, roughness:F.roughness, clearcoat:F.clearcoat, clearcoatRoughness:F.clearcoatRoughness, iridescence:F.irid, iridescenceIOR:1.3, iridescenceThicknessRange:[250,450], anisotropy:F.aniso});
     b.paint.normalScale.set(F.flake, F.flake); b.paint.clearcoatNormalScale.set(F.peel, F.peel); b.dirty = true;
   });
   document.querySelectorAll('.chip').forEach(ch => ch.setAttribute('aria-pressed', ch.dataset.hex === paintHex && ch.dataset.type === finish));
   scheduleCompare();
 }
 // chip preview: face colour on the lit side, flop colour toward the shaded edge
-function chipBg(hex, type){ const {face, flop} = paintLook(hex, type); const f = face.clone().convertLinearToSRGB().getStyle(), d = flop.clone().convertLinearToSRGB().getStyle();
+function chipBg(hex, type){ const {face, flop} = paintLook(hex, type); const f = face.getStyle(), d = flop.getStyle();
   return `linear-gradient(160deg, ${f} 0%, ${f} 35%, ${d} 100%)`; }
 const chips = document.getElementById('chips');
 chips.innerHTML = PAINTS.map(([n,h,t]) => `<button class="chip" data-hex="${h}" data-type="${t}" aria-pressed="false"><i style="background:${chipBg(h,t)}"></i><span>${n}<br><em>${FIN[t].n}</em></span></button>`).join('')
