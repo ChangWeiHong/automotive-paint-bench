@@ -39,6 +39,8 @@ button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:v
 :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 .tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .tools label{display:flex;gap:6px;align-items:center;color:var(--muted);font-size:14px}
+.tools label input[type=range]{width:110px}
+.tools output{font-family:var(--f-mono);font-size:13px;font-variant-numeric:tabular-nums;color:var(--ink);min-width:6ch}
 select{background:var(--raised);border:1px solid var(--line);border-radius:6px;padding:6px 8px;max-width:100%}
 
 /* paint rail */
@@ -115,6 +117,8 @@ input[type=range]{accent-color:var(--ink);height:20px}
     </div>
     <div class="tools">
       <button id="play" aria-pressed="false">Run the clock</button>
+      <button id="drive" aria-pressed="false">Drive</button>
+      <label>Speed <input type="range" id="speed" min="0" max="120" step="5" value="60"><output id="speedO" for="speed">60 km/h</output></label>
       <button id="copyAB">Copy A → B</button>
       <button id="copyBA">Copy B → A</button>
       <label><input type="checkbox" id="sync" checked> Link cameras</label>
@@ -191,7 +195,7 @@ import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 (() => {
-const rad = Math.PI / 180;
+const rad = Math.PI / 180, TAU = Math.PI * 2;
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const gauss = (x, m, s) => Math.exp(-0.5 * ((x - m) / s) ** 2);
 const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
@@ -569,7 +573,7 @@ function buildCar(paint){
   stick(B(.5,.11,.02), plate, 0, .42, .02);
   const lens = new THREE.MeshPhysicalMaterial({color:0x1a1c20, roughness:.05, metalness:.2, clearcoat:1, emissive:0xffffff, emissiveIntensity:0});
   const drl = new THREE.MeshStandardMaterial({color:0x222222, emissive:0xffffff, emissiveIntensity:0});
-  const spots = [];
+  const spots = [], wheels = [];
   [-1,1].forEach(sd => {
     stick(B(.46,.13,.06), chrome, sd*.55, .66, 0);
     stick(B(.42,.1,.05), lens, sd*.55, .665, .018);
@@ -584,8 +588,10 @@ function buildCar(paint){
     const tg = new THREE.CylinderGeometry(.36,.36,.26,36); tg.attributes.uv.array.forEach((v, i, a) => a[i] = v*2.3);
     const t = new THREE.Mesh(tg, tyre); t.rotation.z = Math.PI/2; t.position.set(sd*.87,.36,z); t.castShadow = true; car.add(t);
     const r = new THREE.Mesh(new THREE.CylinderGeometry(.23,.23,.02,28), rim); r.rotation.z = Math.PI/2; r.position.set(sd*1.005,.36,z); car.add(r);
+    for (let k = 0; k < 3; k++){ const sp = new THREE.Mesh(B(.035,.03,.44), trim); sp.rotation.y = k*Math.PI/3; r.add(sp); } // spokes make the spin visible
+    wheels.push({o:t, r:.36, axis:'x', s:1}, {o:r, r:.36, axis:'x', s:1});
   }));
-  return {car, lens, drl, spots};
+  return {car, lens, drl, spots, wheels};
 }
 
 /* ---------- awantech models (GLB, metres, Y up, length along X) ---------- */
@@ -649,7 +655,53 @@ function prepareModel(root){
     if (!(Array.isArray(o.material) ? o.material.includes(paint) : o.material === paint)) return;
     planarUV(o.geometry);
   });
+  splitWheels(root);
   return {root, paint, box: new THREE.Box3().setFromObject(root)};
+}
+/* wheels merged into one mesh per material (all four tyres in one geometry) are still separate shells: split them by connectivity into per-wheel meshes
+   centred on their axle (local +z in these models), tagged userData.spin = {r}. Models whose wheels are fused into the body get none. */
+const attrAt = (a, i, c) => c ? (c === 1 ? a.getY(i) : c === 2 ? a.getZ(i) : a.getW(i)) : a.getX(i);
+function shells(g){
+  const P = g.attributes.position, I = g.index, n = P.count, nt = (I ? I.count : n)/3, rep = new Int32Array(n), par = new Int32Array(n), key = new Map();
+  const vi = (t, k) => I ? I.getX(t*3 + k) : t*3 + k;
+  for (let i = 0; i < n; i++){ const k = Math.round(P.getX(i)*1e4) + ',' + Math.round(P.getY(i)*1e4) + ',' + Math.round(P.getZ(i)*1e4); let r = key.get(k); if (r === undefined){ key.set(k, i); r = i; } rep[i] = r; par[i] = i; }
+  const find = i => { while (par[i] !== i) i = par[i] = par[par[i]]; return i; };
+  for (let t = 0; t < nt; t++){ const a = find(rep[vi(t,0)]); [1,2].forEach(k => { const b = find(rep[vi(t,k)]); if (a !== b) par[b] = a; }); }
+  const out = new Map();
+  for (let t = 0; t < nt; t++){
+    const id = find(rep[vi(t,0)]); let c = out.get(id); if (!c) out.set(id, c = {tris:[], min:[1e9,1e9,1e9], max:[-1e9,-1e9,-1e9]}); c.tris.push(t);
+    for (let k = 0; k < 3; k++){ const v = vi(t,k); for (let d = 0; d < 3; d++){ const x = attrAt(P, v, d); if (x < c.min[d]) c.min[d] = x; if (x > c.max[d]) c.max[d] = x; } }
+  }
+  return [...out.values()];
+}
+function subGeo(g, tris, cx = 0, cy = 0){
+  const I = g.index, map = new Int32Array(g.attributes.position.count).fill(-1), vs = [], ni = [];
+  for (const t of tris) for (let k = 0; k < 3; k++){ const v = I ? I.getX(t*3 + k) : t*3 + k; if (map[v] < 0){ map[v] = vs.length; vs.push(v); } ni.push(map[v]); }
+  const o = new THREE.BufferGeometry();
+  for (const name in g.attributes){ const a = g.attributes[name], S = a.itemSize, arr = new Float32Array(vs.length*S);
+    vs.forEach((v, i) => { for (let c = 0; c < S; c++) arr[i*S + c] = attrAt(a, v, c); }); o.setAttribute(name, new THREE.BufferAttribute(arr, S)); }
+  o.setIndex(ni); o.translate(-cx, -cy, 0); o.computeBoundingSphere(); o.computeBoundingBox();
+  return o;
+}
+function splitWheels(root){
+  const parts = [], wheels = [];
+  root.traverse(o => { if (o.isMesh && o.userData.wheel && !Array.isArray(o.material) && o.parent && o.position.lengthSq() === 0 && o.quaternion.w === 1 && o.scale.x === 1 && o.scale.y === 1 && o.scale.z === 1) parts.push({o, sh: shells(o.geometry)}); });
+  const round = c => { const dx = c.max[0]-c.min[0], dy = c.max[1]-c.min[1], dz = c.max[2]-c.min[2]; return dy >= .4 && dy <= 1.4 && Math.abs(dx-dy) < .15*dy && dz < .6*dy; };
+  parts.flatMap(p => p.sh).filter(round).sort((a, b) => (b.max[1]-b.min[1]) - (a.max[1]-a.min[1])).forEach(c => {
+    const cx = (c.min[0]+c.max[0])/2, cy = (c.min[1]+c.max[1])/2, cz = (c.min[2]+c.max[2])/2, r = (c.max[1]-c.min[1])/2;
+    if (!wheels.some(w => Math.hypot(w.cx-cx, w.cy-cy) < .1*r && Math.abs(w.cz-cz) < .3)) wheels.push({cx, cy, cz, r, hz: (c.max[2]-c.min[2])/2}); });
+  if (!wheels.length) return;
+  parts.forEach(({o, sh}) => {
+    const mine = wheels.map(() => []), rest = [];
+    sh.forEach(c => {
+      const x = (c.min[0]+c.max[0])/2, y = (c.min[1]+c.max[1])/2, z = (c.min[2]+c.max[2])/2, sz = Math.max(c.max[0]-c.min[0], c.max[1]-c.min[1])/2;
+      const w = wheels.findIndex(w => Math.hypot(x-w.cx, y-w.cy) + sz <= w.r*1.03 && Math.abs(z-w.cz) <= w.hz + .02);
+      const dst = w < 0 ? rest : mine[w]; for (const t of c.tris) dst.push(t);
+    });
+    if (!mine.some(m => m.length)) return;
+    mine.forEach((tris, i) => { if (!tris.length) return; const w = wheels[i], m = new THREE.Mesh(subGeo(o.geometry, tris, w.cx, w.cy), o.material); m.position.set(w.cx, w.cy, 0); m.userData.spin = {r: w.r}; o.parent.add(m); });
+    if (rest.length) o.geometry = subGeo(o.geometry, rest); else o.parent.remove(o);
+  });
 }
 function planarUV(g){
   if (!g.attributes.normal) g.computeVertexNormals();
@@ -870,7 +922,7 @@ function makeBench(key, init){
   let envRT = null;
 
   const paint = makePaint();
-  const {car, lens, drl, spots} = buildCar(paint);
+  const {car, lens, drl, spots, wheels: carWheels} = buildCar(paint);
   const holder = new THREE.Group(); holder.add(car); scene.add(holder);
   let imported = null;
 
@@ -948,7 +1000,7 @@ function makeBench(key, init){
     if (def.ground){ ground.material.roughness = W.wet ? .55 : .95; ground.material.color.set(def.ground).multiplyScalar(W.wet ? .7 : 1); }
 
     lamp.visible = c.street !== 'none';
-    streetL.color.setRGB(...r.streetCol); streetL.intensity = r.streetI/.8*Math.PI*36;
+    streetL.color.setRGB(...r.streetCol); streetL.intensity = B.streetBase = r.streetI/.8*Math.PI*36;
     headMat.emissive.setRGB(...r.streetCol); headMat.emissiveIntensity = r.streetI*600;
 
     const H = HEAD[c.head];
@@ -973,6 +1025,7 @@ function makeBench(key, init){
     st('w').textContent = `${r.s.w.toFixed(1)} cm`;
     const phase = e > 6 ? 'day' : e > 0 ? 'golden hour' : e > -6 ? 'civil twilight' : e > -12 ? 'nautical twilight' : 'night';
     el.querySelector('.summary').textContent = `${REGIONS[c.region].name} · ${fmtDay(c.day)} ${fmtTime(c.time)} ${fmtTz(c.tz)} · ${WEATHER[c.weather].n} · ${phase}`;
+    B.props();
     B.dirty = true;
     scheduleCompare();
   };
@@ -982,9 +1035,30 @@ function makeBench(key, init){
     renderer.setSize(w, h, false); camera.aspect = w/h; camera.updateProjectionMatrix(); B.dirty = true;
   }).observe(view);
   controls.addEventListener('change', () => { B.dirty = true; B.onCamera && B.onCamera(); });
+  /* drive: the car stays put and the world scrolls (studio: the car turns); wheels, body heave and street-light pulse follow the shared distance */
+  B.wheels = carWheels; B.driving = false; B.base = 0;
+  B.props = () => { const hide = B.driving && !!B.world && B.world.tiles.length > 0; grey.visible = ball.visible = pole.visible = arm.visible = head.visible = !hide; };
+  B.setDrive = on => {
+    B.driving = on; B.props();
+    const sh = sun.shadow; if (sh.map){ sh.dispose(); sh.map = null; } sh.mapSize.set(on ? 1024 : 2048, on ? 1024 : 2048);
+    if (!on) B.drive(0, 0, 0, 0);
+    B.dirty = true;
+  };
+  B.drive = (dist, v, t, turn) => {
+    const W = B.world, road = W.tiles.length > 0, k = road ? v/33.3 : 0, tt = t/1000, ang = road ? 0 : turn;
+    const by = k*.0012*(Math.sin(tt*9.1)*.6 + Math.sin(tt*14.7 + 1.3)*.4), bp = k*.0005*Math.sin(tt*5.3 + .7); // mm-level heave, sub-mrad pitch
+    W.setOffset(-dist);
+    car.rotation.y = ang; car.position.y = by; car.rotation.x = bp;
+    if (imported){ imported.rotation.y = B.base + ang; imported.position.y = by; imported.rotation.x = bp; }
+    for (let i = 0; i < B.wheels.length; i++){ const w = B.wheels[i]; w.o.rotation[w.axis] = w.s*((dist/w.r) % TAU); }
+    if (B.driving && road && lamp.visible){ const f = .5 + .5*Math.cos(dist*TAU/30); streetL.intensity = B.streetBase*(.25 + .75*f*Math.sqrt(f)); } // passing under lamps 30 m apart
+    else streetL.intensity = B.streetBase;
+    B.dirty = true;
+  };
   B.render = () => { if (B.dirty){ renderer.render(scene, camera); B.dirty = false; } };
   B.setModel = (prep, front) => {
     if (imported){ holder.remove(imported); imported = null; }
+    B.wheels = carWheels;
     car.children.forEach(o => { if (!o.isLight && !(o.isObject3D && spots.some(s => s.target === o))) o.visible = !prep; });
     let half = 2.35;
     if (prep){
@@ -994,7 +1068,8 @@ function makeBench(key, init){
         else if (o.material === prep.paint) o.material = paint; });
       const ctr = prep.box.getCenter(new THREE.Vector3());
       inner.position.set(-ctr.x, -prep.box.min.y, -ctr.z);
-      imported = new THREE.Group(); imported.add(inner); imported.rotation.y = front > 0 ? -Math.PI/2 : Math.PI/2;
+      imported = new THREE.Group(); imported.add(inner); B.base = imported.rotation.y = front > 0 ? -Math.PI/2 : Math.PI/2;
+      B.wheels = []; inner.traverse(o => { if (o.userData.spin) B.wheels.push({o, r:o.userData.spin.r, axis:'z', s: front > 0 ? -1 : 1}); });
       holder.add(imported);
       half = (prep.box.max.x - prep.box.min.x)/2;
     }
@@ -1017,7 +1092,7 @@ function setScene(key, upd = true){ // both bays switch together: drop old props
   benches.forEach(b => b.clearScene());
   sceneGeos.forEach(g => g.dispose()); sceneGeos = [];
   const G = sceneGeometry(key);
-  benches.forEach(b => b.buildScene(key, G));
+  benches.forEach(b => b.buildScene(key, G)); applyNow = true;
   if (upd) benches.forEach(b => b.update());
 }
 sceneSel.addEventListener('change', () => setScene(sceneSel.value));
@@ -1029,7 +1104,7 @@ function scheduleCompare(){ if (!compareQueued){ compareQueued = true; requestAn
 
 const A = makeBench('a', DEF_A), Bb = makeBench('b', DEF_B);
 const benches = [A, Bb];
-window.__bench = {benches, setScene}; // test hook
+window.__bench = {benches, setScene, get frames(){ return frames; }, get dist(){ return dist; }}; // test hook
 
 function applyPaint(){
   const F = FIN[finish], look = paintLook(paintHex, finish);
@@ -1066,9 +1141,24 @@ const copy = (from, to) => { Object.assign(to.c, from.c); to.syncUI(); to.update
 document.getElementById('copyAB').onclick = () => copy(A, Bb);
 document.getElementById('copyBA').onclick = () => copy(Bb, A);
 
+let driving = false, speed = 60, dist = 0, turn = 0, lastD = -1, applyNow = false, frames = 0;
 let playing = false;
 const playBtn = document.getElementById('play');
 playBtn.onclick = () => { playing = !playing; playBtn.setAttribute('aria-pressed', playing); playBtn.textContent = playing ? 'Stop the clock' : 'Run the clock'; };
+
+const driveBtn = document.getElementById('drive'), speedIn = document.getElementById('speed'), speedO = document.getElementById('speedO');
+driveBtn.onclick = () => {
+  driving = !driving; driveBtn.setAttribute('aria-pressed', driving); driveBtn.textContent = driving ? 'Stop' : 'Drive';
+  dist = turn = 0; lastD = -1; applyNow = true;
+  benches.forEach(b => b.setDrive(driving));
+};
+speedIn.addEventListener('input', () => { speed = +speedIn.value; speedO.textContent = `${speed} km/h`; });
+function advance(dt, t){
+  const v = speed/3.6;
+  if (v === 0 && !applyNow) return;
+  applyNow = false; dist += v*dt; turn += speed/120*TAU/6*dt; // 120 km/h = one turntable turn per 6 s
+  for (let i = 0; i < benches.length; i++) benches[i].drive(dist, v, t, turn);
+}
 
 /* ---------- comparison panel ---------- */
 const chart = document.getElementById('chart');
@@ -1123,10 +1213,10 @@ modelSel.innerHTML = Object.entries(MODELS).map(([k, m]) => `<option value="${k}
 let modelReq = 0;
 function setModel(key){
   const req = ++modelReq, M = MODELS[key];
-  if (!M.file){ benches.forEach(b => b.setModel(null)); loadState.textContent = ''; return; }
+  if (!M.file){ benches.forEach(b => b.setModel(null)); applyNow = true; loadState.textContent = ''; return; }
   loadState.textContent = `Loading ${M.n}…`;
   loadModel(key, e => { if (req === modelReq && e.total) loadState.textContent = `Loading ${M.n}… ${(e.loaded/1e6).toFixed(1)} / ${(e.total/1e6).toFixed(1)} MB`; })
-    .then(prep => { if (req !== modelReq) return; benches.forEach(b => b.setModel(prep, M.front));
+    .then(prep => { if (req !== modelReq) return; benches.forEach(b => b.setModel(prep, M.front)); applyNow = true;
       loadState.textContent = prep.paint ? '' : 'No body panel found to repaint'; })
     .catch(() => { if (req === modelReq){ delete modelCache[key]; loadState.textContent = `Could not load ${M.n}. Pick it again to retry.`; } });
 }
@@ -1139,12 +1229,19 @@ setModel(modelSel.value);
 
 let lastT = 0;
 function loop(t){
+  requestAnimationFrame(loop);
+  if (document.visibilityState === 'hidden'){ lastD = -1; return; }
   if (playing && t - lastT > 40){
     lastT = t;
     benches.forEach(b => { b.c.time = (b.c.time + .1) % 24; b.syncUI(); b.update(); });
   }
-  benches.forEach(b => b.render());
-  requestAnimationFrame(loop);
+  if (driving){ // 30 fps cap while driving; both bays advance from the same distance
+    if (lastD >= 0 && t - lastD < 31) return;
+    const dt = lastD < 0 ? 0 : Math.min((t - lastD)/1000, .1); lastD = t; advance(dt, t);
+  }
+  let any = false;
+  for (let i = 0; i < benches.length; i++) if (benches[i].dirty){ benches[i].render(); any = true; }
+  if (any) frames++;
 }
 requestAnimationFrame(loop);
 })();
