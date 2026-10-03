@@ -1162,7 +1162,7 @@ function advance(dt, t){
 
 /* ---------- comparison panel ---------- */
 const chart = document.getElementById('chart');
-const visStrip = (() => { const out = []; for (let l = 380; l <= 780; l += 2){ const rgb = xyz2rgb(cmfAt(l)).map(v => Math.max(v,0)); const m = Math.max(...rgb, 1e-6); const y = cmfAt(l)[1]; out.push([l, linToHex(rgb.map(v => v/m*clamp(y*2.2+.08,0,1)))]); } return out; })();
+const visStrip = (() => { const out = []; for (let l = 380; l <= 780; l += 2){ const rgb = xyz2rgb(cmfAt(Math.min(l, 650))).map(v => Math.max(v,0)); /* fitted CMF tails turn green past ~700 nm; hold the red hue */ const m = Math.max(...rgb, 1e-6); const y = cmfAt(l)[1]; out.push([l, linToHex(rgb.map(v => v/m*clamp(y*2.2+.08,0,1)))]); } return out; })();
 function drawChart(){
   const dpr = Math.min(devicePixelRatio, 2), W = chart.clientWidth, H = chart.clientHeight;
   if (!W) return;
