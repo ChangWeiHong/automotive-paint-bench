@@ -131,6 +131,9 @@ input[type=range]{accent-color:var(--ink);height:20px}
       <label>Model
         <select id="model"></select>
       </label>
+      <label>Scene
+        <select id="scene"></select>
+      </label>
       <span class="load" id="loadState" role="status"></span>
       <label>Finish
         <select id="finish"><option value="solid" selected>Solid</option><option value="metallic">Metallic</option><option value="pearl">Pearl (tri-coat)</option><option value="candy">Candy</option><option value="matte">Satin</option></select>
@@ -368,7 +371,7 @@ function lab(rgb){
 
 /* ---------- three.js scene ---------- */
 const SKY_FRAG = `
-uniform vec3 zen,hor,gnd,glow,disc,sunDir; uniform float exposure, display, haze;
+uniform vec3 zen,hor,gnd,glow,disc,sunDir,skyP; uniform vec2 skyDir; uniform float exposure, display, haze;
 float hash(float n){ return fract(sin(n*12.9898)*43758.5453); }
 varying vec3 vDir;
 vec3 rrt(vec3 v){ vec3 a=v*(v+0.0245786)-0.000090537; vec3 b=v*(0.983729*v+0.4329510)+0.238081; return a/b; }
@@ -380,12 +383,13 @@ vec3 aces(vec3 c){
 void main(){
   vec3 d=normalize(vDir); float h=d.y; vec3 c;
   if(h>=0.) c=mix(hor,zen,pow(clamp(h,0.,1.),0.45)); else c=mix(hor,gnd,clamp(-h*12.,0.,1.));
-  // distant city skyline: gives the clearcoat something to reflect
-  float seg=floor((atan(d.z,d.x)+3.14159)*14.); float hb=hash(seg);
-  float H = hb<0.3 ? 0.006+0.012*hash(seg+7.) : 0.015+0.075*hb*hb;
-  float bld = step(0.,h)*step(h,H);
-  vec3 face = (gnd*1.9 + hor*0.06)*(0.55+0.45*hash(seg+3.));
-  c = mix(c, mix(face, hor, clamp(haze*0.85+0.12,0.,1.)), bld);
+  // distant skyline, set per scene: skyP = (0 none | 1 city blocks | 2 rolling hills, height scale, sea-side mask); skyDir = world direction of the sea
+  float ang=atan(d.z,d.x), seg=floor((ang+3.14159)*14.); float hb=hash(seg); bool hills=skyP.x>1.5;
+  float H = hills ? 0.012+0.02*(.5+.5*sin(ang*2.+1.))*(.6+.4*sin(ang*5.+2.))+.006*sin(ang*11.) : (hb<0.3 ? 0.006+0.012*hash(seg+7.) : 0.015+0.075*hb*hb);
+  H *= skyP.y*mix(1.,smoothstep(-.15,.35,-dot(normalize(d.xz+1e-5),skyDir)),skyP.z);
+  float bld = step(.0001,H)*step(0.,h)*step(h,H);
+  vec3 face = hills ? gnd*1.2+hor*.1 : (gnd*1.9 + hor*0.06)*(0.55+0.45*hash(seg+3.));
+  c = mix(c, mix(face, hor, clamp(haze*0.85+(hills?.4:.12),0.,1.)), bld);
   float s=max(dot(d,normalize(sunDir)),0.);
   c+=glow*(pow(s,6.)*0.6+pow(s,48.)*1.2)*smoothstep(-0.06,0.02,h);
   c+=disc*smoothstep(0.99990,0.99996,s)*step(0.,h)*(1.-bld);
@@ -398,7 +402,7 @@ const skyMat = display => new THREE.ShaderMaterial({
   side: THREE.BackSide, depthWrite: false, fog: false,
   uniforms: {zen:{value:new THREE.Vector3()}, hor:{value:new THREE.Vector3()}, gnd:{value:new THREE.Vector3()},
     glow:{value:new THREE.Vector3()}, disc:{value:new THREE.Vector3()}, sunDir:{value:new THREE.Vector3(0,1,0)},
-    exposure:{value:1}, haze:{value:0}, display:{value:display ? 1 : 0}},
+    exposure:{value:1}, haze:{value:0}, display:{value:display ? 1 : 0}, skyP:{value:new THREE.Vector3()}, skyDir:{value:new THREE.Vector2(1,0)}},
   vertexShader: SKY_VERT, fragmentShader: SKY_FRAG,
 });
 const linColor = hex => new THREE.Color(hex);
@@ -673,6 +677,124 @@ function loadModel(key, onProgress){
   return modelCache[key];
 }
 
+/* ---------- scenes ----------
+   One scene is built per bay (geometries shared by both bays) into a group inside `holder`: the car faces +Z, x is lateral, road surface y = .03.
+   Road scenes repeat TILE-long tiles along z. Each bay exposes B.world = {group, tileLength, tiles:[Group…], setOffset(z), road, env}.
+   Driving: keep the car still and call B.world.setOffset(distance); tiles wrap, so the road loops seamlessly. Studio has no tiles (turntable instead).
+   Flat colours come from per-instance colour on plain Standard materials; no textures. */
+const TILE = 60, NTILE = 9;
+const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _p = new THREE.Vector3(), _s = new THREE.Vector3(), _c = new THREE.Color(), _e = new THREE.Euler();
+// items: [x, y, z, sx, sy, sz, colour, rotY, rotZ]
+function inst(parent, geo, mat, items, rx){
+  if (!items.length) return;
+  const im = new THREE.InstancedMesh(geo, mat, items.length);
+  items.forEach((a, i) => { im.setMatrixAt(i, _m.compose(_p.set(a[0], a[1], a[2]), _q.setFromEuler(_e.set(0, a[7] || 0, a[8] || 0)), _s.set(a[3], a[4], a[5]))); im.setColorAt(i, _c.set(a[6] || '#ffffff')); });
+  im.receiveShadow = !!rx; parent.add(im);
+}
+const rng = seed => () => (seed = (seed*1664525 + 1013904223) >>> 0) / 4294967296;
+let sceneGeos = [];
+const keep = g => (sceneGeos.push(g), g);
+const pick1 = (r, a) => a[Math.floor(r()*a.length)];
+const PASTEL = ['#d8c9a8','#c9d3c4','#d9b8a0','#b9c7d6','#e0d6c2','#cdb5b0','#e8e0cf'];
+const SCENES = {
+  city: {n:'Malaysian city road', ground:'#4c4b48', envG:1, sky:[1,1,0], balls:[2.75,3.25,.15],
+    build(W, G, mat){
+      const C = -1.7, u = (s, d) => C + s*d; // road centre; offset outward on side s (+1 = car's left kerb)
+      const road = W.road = mat('#303134', .92, -1), mark = mat('#fff', .8, -2), prop = mat('#fff', .9), win = mat('#1d2a33', .3), leaf = mat('#fff', .9);
+      W.tiled((t, r) => {
+        const P = [], Wn = [], Mk = [], T = [], Cr = [];
+        inst(t, G.box, road, [[C,0,0,7.2,.06,TILE+.02]], 1);
+        for (let k = 0; k < 6; k++) Mk.push([C,.04,-25+k*10,.15,.02,4]);
+        [1,-1].forEach(s => {
+          Mk.push([u(s,3.45),.04,0,.12,.02,TILE]);
+          P.push([u(s,3.725),.075,0,.25,.15,TILE,'#a09f9a'], [u(s,5.925),.075,0,4.15,.15,TILE,'#8d8c88']);
+          const n = 8, w = TILE/n;
+          for (let i = 0; i < n; i++){ // shophouses: shop floor behind a five-foot-way, upper floors overhanging it
+            if (s > 0 && r() < .2) continue;
+            const z = -TILE/2 + w*(i + .5), fl = 2 + (r() < .5), H = 3.5 + (fl-1)*3.2, col = pick1(r, PASTEL);
+            P.push([u(s,14),1.825,z,12,3.35,w,col], [u(s,13.05),(3.5+H)/2,z,13.9,H-3.5,w-.12,col], [u(s,6.3),1.825,z-w/2+.4,.35,3.35,.35,'#e8e3d6']);
+            Wn.push([u(s,7.97),1.7,z,.06,2.2,w*.8]);
+            for (let f = 1; f < fl; f++) Wn.push([u(s,6.07),3.5+(f-1)*3.2+1.7,z,.06,1.5,w*.78]);
+          }
+          const th = 40 + r()*70;
+          P.push([u(s,34+r()*16),th/2,-20+r()*40,14+r()*8,th,14+r()*8,pick1(r, ['#8e9aa6','#a3adb5','#7d8791'])]);
+          for (let k = 0; k < 4; k++){ // palms and rain trees
+            const z = -22.5 + 15*k, palm = r() < .5, h = palm ? 7 + r()*2 : 4.6, rt = palm ? .16 : .24;
+            T.push([u(s,4.9),.15+h/2,z,rt,h,rt,'#6b5a45']);
+            Cr.push(palm ? [u(s,4.9),.25+h,z,1.8,.5,1.8,'#4f8a3a'] : [u(s,4.9),.85+h,z,2.1,1.1,2.1,pick1(r, ['#3f6b34','#4a7a3a'])]);
+          }
+          (s > 0 ? [-15,15] : [0]).forEach(z => P.push([u(s,4),3.15,z,.14,6,.14,'#5a5d62'], [u(s,2.9),6.1,z,2.2,.06,.06,'#5a5d62'], [u(s,1.9),6.05,z,.55,.08,.26,'#e8e8e0']));
+        });
+        inst(t, G.box, prop, P, 1); inst(t, G.box, win, Wn); inst(t, G.box, mark, Mk, 1); inst(t, G.trunk, prop, T); inst(t, G.crown, leaf, Cr);
+      });
+      [1,-1].forEach(s => { W.env.push({geo:G.box, k:2, p:[u(s,13.05),4.5,0], s:[13.9,9,TILE*NTILE]}); [-90,90].forEach(z => W.env.push({geo:G.box, k:2, p:[u(s,45),30,z], s:[20,60,20]})); });
+    }},
+  highway: {n:'Highway', ground:'#56663a', envG:1.25, sky:[2,1,0], balls:[2.7,3.2,.03],
+    build(W, G, mat){
+      const road = W.road = mat('#34353a', .92, -1), mark = mat('#fff', .8, -2), prop = mat('#fff', .9);
+      W.tiled((t, r, i) => {
+        const P = [], Mk = [], M = [];
+        inst(t, G.box, road, [[-2.45,0,0,13.6,.06,TILE+.02]], 1);
+        for (let k = 0; k < 5; k++) [-1.85,-5.55].forEach(x => Mk.push([x,.04,-24+k*12,.15,.02,4]));
+        [1.95,-9.1].forEach(x => Mk.push([x,.04,0,.15,.02,TILE]));
+        [4.9,-10].forEach(x => { P.push([x,.55,0,.1,.3,TILE,'#aeb4ba']); for (let k = 0; k < 15; k++) P.push([x+.05,.35,-28+k*4,.1,.7,.12,'#8a9096']); });
+        if (i % 3 === 1){ // overhead gantry sign
+          P.push([5.4,3.5,10,.5,7,.5,'#9aa0a6'], [-10.6,3.5,10,.5,7,.5,'#9aa0a6'], [-2.6,7,10,16.5,.5,.6,'#9aa0a6']);
+          [-1.85,-6].forEach(x => P.push([x,5.4,10,4.9,2.6,.1,'#f2f2f2'], [x,5.4,10,4.6,2.3,.16,'#1b6a45']));
+        }
+        [-1,1].forEach((s, k) => { const w = 40 + r()*50; M.push([s*(80+r()*90)-2.5,0,-30+r()*60,w,6+r()*8,w*(.7+r()*.5),['#6a7d50','#778859'][k]]); });
+        inst(t, G.box, prop, P, 1); inst(t, G.box, mark, Mk, 1); inst(t, G.crown, prop, M);
+      });
+    }},
+  coast: {n:'Coastal road', ground:'#80795a', envG:3, sky:[1,.3,1], balls:[2.7,3.2,.05],
+    geo(G){ G.sea = keep(new THREE.PlaneGeometry(800,800)); },
+    build(W, G, mat){
+      const road = W.road = mat('#303134', .92, -1), mark = mat('#fff', .8, -2), prop = mat('#fff', .9), leaf = mat('#fff', .9), sea = mat('#06505a', .05, -1);
+      const sp = new THREE.Mesh(G.sea, sea); sp.rotation.x = -Math.PI/2; sp.position.set(-414,.012,0); W.group.add(sp);
+      W.tiled((t, r) => {
+        const P = [], Mk = [], T = [], Cr = [];
+        inst(t, G.box, road, [[-1.75,0,0,7.3,.06,TILE+.02]], 1);
+        for (let k = 0; k < 6; k++) Mk.push([-1.7,.04,-25+k*10,.15,.02,4]);
+        [-5.2,1.7].forEach(x => Mk.push([x,.04,0,.12,.02,TILE]));
+        P.push([2.025,.06,0,.25,.12,TILE,'#a09f9a'], [5.575,.0225,0,6.85,.045,TILE,'#d3c08c'], [-9.7,.0225,0,8.6,.045,TILE,'#d9c796'], [-6,.6,0,.08,.3,TILE,'#b4b9be']);
+        for (let k = 0; k < 15; k++) P.push([-6.05,.4,-28+k*4,.1,.8,.12,'#8a9096']);
+        for (let k = 0; k < 6; k++){ // palms on the land side, leaning a little
+          const x = k < 4 ? 4.5 + r()*.8 : 7.8, z = k < 4 ? -22.5 + 15*k + (r()-.5)*4 : -10 + (k-4)*24 + r()*4, h = 7 + r()*3, tl = (r()-.5)*.25;
+          T.push([x-Math.sin(tl)*h/2,.045+Math.cos(tl)*h/2,z,.16,h,.16,'#7a6a52',0,tl]);
+          Cr.push([x-Math.sin(tl)*h,.145+Math.cos(tl)*h,z,2.4,.7,2.4,'#4f8a3a']);
+        }
+        inst(t, G.box, prop, P, 1); inst(t, G.box, mark, Mk, 1); inst(t, G.trunk, prop, T); inst(t, G.crown, leaf, Cr);
+      });
+      W.env.push({geo:G.box, kind:'sea', k:.55, p:[-364,0,0], s:[700,.01,1400]});
+    }},
+  studio: {n:'Studio (cyclorama)', ground:null, envG:1, sky:[0,0,0], balls:[1.95,2.5,0],
+    geo(G){ // white floor curving up into a wall, all the way round
+      const pts = [new THREE.Vector2(22,14)]; for (let i = 0; i <= 12; i++){ const a = (1 - i/12)*Math.PI/2; pts.push(new THREE.Vector2(14 + 8*Math.sin(a), 8 - 8*Math.cos(a))); } pts.push(new THREE.Vector2(0,0));
+      G.cyc = keep(new THREE.LatheGeometry(pts, 72));
+    },
+    build(W, G, mat){
+      const cyc = mat('#c4c4c1', .65); cyc.side = THREE.DoubleSide;
+      const m = new THREE.Mesh(G.cyc, cyc); m.receiveShadow = true; W.group.add(m);
+      W.env.push({geo:G.cyc, k:5, p:[0,0,0]});
+    }},
+};
+function buildWorld(def, G){
+  const W = {group:new THREE.Group(), tileLength:TILE, tiles:[], setOffset(){}, road:null, env:[], mats:[]};
+  const mat = (hex, rough, off) => { const m = new THREE.MeshStandardMaterial({color:hex, roughness:rough}); if (off){ m.polygonOffset = true; m.polygonOffsetFactor = m.polygonOffsetUnits = off; } W.mats.push(m); return m; };
+  W.tiled = fn => {
+    for (let i = 0; i < NTILE; i++){ const t = new THREE.Group(); t.userData.z0 = (i - (NTILE-1)/2)*TILE; fn(t, rng(i*977 + 13), i); W.tiles.push(t); W.group.add(t); }
+    const span = NTILE*TILE;
+    W.setOffset = z => W.tiles.forEach(t => t.position.z = ((t.userData.z0 + z + span/2) % span + span) % span - span/2);
+    W.setOffset(0);
+  };
+  def.build(W, G, mat);
+  return W;
+}
+const sceneGeometry = key => { // shared by both bays; disposed when the scene is switched away
+  const G = {box:keep(new THREE.BoxGeometry(1,1,1)), trunk:keep(new THREE.CylinderGeometry(.75,1,1,6)), crown:keep(new THREE.IcosahedronGeometry(1,1))};
+  SCENES[key].geo?.(G); return G;
+};
+
 function makeBench(key, init){
   const el = document.getElementById('bay-' + key);
   el.innerHTML = `
@@ -734,7 +856,7 @@ function makeBench(key, init){
   renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   view.prepend(renderer.domElement);
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(32, 1.6, .1, 1500);
+  const camera = new THREE.PerspectiveCamera(32, 1.6, .3, 1500);
   camera.position.set(3.4, 1.45, 7.4);
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.target.set(0, .75, .3); controls.minDistance = 3.5; controls.maxDistance = 20; controls.maxPolarAngle = 1.53;
@@ -743,6 +865,7 @@ function makeBench(key, init){
   const skyGeo = new THREE.SphereGeometry(600, 48, 24);
   const sky = new THREE.Mesh(skyGeo, skyMat(true)); scene.add(sky);
   const envScene = new THREE.Scene(); const envSky = new THREE.Mesh(skyGeo, skyMat(false)); envScene.add(envSky);
+  const envWorld = new THREE.Group(); envWorld.position.y = -.9; envScene.add(envWorld); // cheap proxy of the surroundings, seen from a probe 0.9 m above the road
   const pmrem = new THREE.PMREMGenerator(renderer); pmrem.compileCubemapShader();
   let envRT = null;
 
@@ -751,15 +874,13 @@ function makeBench(key, init){
   const holder = new THREE.Group(); holder.add(car); scene.add(holder);
   let imported = null;
 
-  const ground = new THREE.Mesh(new THREE.CircleGeometry(400, 72), new THREE.MeshStandardMaterial({color:linColor('#303134'), roughness:.92}));
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(400, 72), new THREE.MeshStandardMaterial({roughness:.92}));
   ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
-  const lineMat = new THREE.MeshStandardMaterial({color:linColor('#d9d8d0'), roughness:.8});
-  [-1.55, 1.55].forEach(x => { const m = new THREE.Mesh(new THREE.PlaneGeometry(.12, 5.4), lineMat); m.rotation.x = -Math.PI/2; m.position.set(x,.004,-.2); m.receiveShadow = true; scene.add(m); });
-  // lookdev reference balls: 18% grey + chrome
+  // lookdev reference balls: 18% grey + chrome (beside the car, positioned per scene)
   const grey = new THREE.Mesh(new THREE.SphereGeometry(.2,32,16), new THREE.MeshStandardMaterial({color:new THREE.Color(.18,.18,.18), roughness:.95}));
-  grey.position.set(1.95,.2,3.05); grey.castShadow = true; scene.add(grey);
+  grey.castShadow = true; holder.add(grey);
   const ball = new THREE.Mesh(new THREE.SphereGeometry(.2,32,16), new THREE.MeshStandardMaterial({color:0xffffff, metalness:1, roughness:.03}));
-  ball.position.set(2.5,.2,2.75); ball.castShadow = true; scene.add(ball);
+  ball.castShadow = true; holder.add(ball);
 
   const sun = new THREE.DirectionalLight(0xffffff, 1);
   sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
@@ -774,17 +895,33 @@ function makeBench(key, init){
   const headMat = new THREE.MeshStandardMaterial({color:0x111111, emissive:0xffffff, emissiveIntensity:0});
   const head = new THREE.Mesh(new THREE.BoxGeometry(.55,.08,.26), headMat); head.position.set(.5,5.9,-.6);
   const streetL = new THREE.PointLight(0xffffff, 0, 30, 2); streetL.position.set(.5,5.7,-.6);
-  lamp.add(pole, arm, head, streetL); scene.add(lamp);
+  lamp.add(pole, arm, head, streetL); holder.add(lamp);
 
   const vec = a => new THREE.Vector3(a[0], a[1], a[2]);
   B.dirty = true;
   B.renderer = renderer; B.scene = scene; B.sun = sun; B.camera = camera; B.controls = controls; B.paint = paint; B.ground = ground;
+
+  B.half = 2.35;
+  B.clearScene = () => {
+    if (!B.world) return;
+    holder.remove(B.world.group); B.world.group.traverse(o => o.dispose && o.dispose()); B.world.mats.forEach(m => m.dispose());
+    envWorld.children.slice().forEach(m => { m.material.dispose(); envWorld.remove(m); });
+    B.world = null;
+  };
+  B.buildScene = (key, G) => {
+    const def = B.def = SCENES[key], W = B.world = buildWorld(def, G);
+    holder.add(W.group);
+    W.env.forEach(e => { const m = new THREE.Mesh(e.geo, new THREE.MeshBasicMaterial({side:THREE.DoubleSide})); m.position.set(...e.p); m.scale.set(...(e.s || [1,1,1])); m.userData = e; envWorld.add(m); });
+    ground.visible = !!def.ground;
+    grey.position.set(def.balls[0], def.balls[2] + .2, B.half + .75); ball.position.set(def.balls[1], def.balls[2] + .2, B.half + .45);
+  };
 
   B.update = () => {
     const r = B.res = solve(c);
     const {az, el: e} = r.sp;
     const sd = new THREE.Vector3(Math.sin(az*rad)*Math.cos(e*rad), Math.sin(e*rad), -Math.cos(az*rad)*Math.cos(e*rad));
     holder.rotation.y = -(c.heading - 180)*rad; // 180° = facing south (+Z)
+    const th = holder.rotation.y, def = B.def; envWorld.rotation.y = th;
     sun.position.copy(sd).multiplyScalar(40); sun.color.setRGB(...r.sunCol); sun.intensity = e > -1 ? r.sunI*Math.PI : 0;
     const strength = WEATHER[c.weather].c;
     sun.castShadow = strength < 1 && e > 0;
@@ -795,7 +932,10 @@ function makeBench(key, init){
       u.glow.value.copy(vec(r.glow)); u.sunDir.value.copy(sd);
       u.haze.value = 1 - Math.exp(-(WEATHER[c.weather].fog ?? Math.max(.0065, r.s.aod*.006))*350);
       u.disc.value.copy(m === sky.material ? vec(r.disc) : new THREE.Vector3());
+      u.skyP.value.set(...def.sky); u.skyDir.value.set(-Math.cos(th), Math.sin(th)); // sea lies toward the car's right (-x)
     });
+    envSky.material.uniforms.gnd.value.multiplyScalar(def.envG);
+    envWorld.children.forEach(m => { const e = m.userData, col = e.kind === 'sea' ? r.hor : r.gnd; m.material.color.setRGB(col[0]*e.k, col[1]*e.k, col[2]*e.k); });
     if (envRT) envRT.dispose();
     envRT = pmrem.fromScene(envScene, 0, .1, 1000);
     scene.environment = envRT.texture;
@@ -803,8 +943,9 @@ function makeBench(key, init){
     const W = WEATHER[c.weather];
     const fogD = W.fog ?? Math.max(.0065, r.s.aod*.006);
     scene.fog = new THREE.FogExp2(new THREE.Color(...r.hor), fogD);
-    ground.material.roughness = W.wet ? .14 : .92;
-    ground.material.color.copy(linColor(W.wet ? '#1f2023' : '#303134'));
+    const road = B.world.road; // wet weather makes road surfaces glossy
+    if (road){ road.roughness = W.wet ? .14 : .92; road.color.set(W.wet ? '#1f2023' : '#303134'); }
+    if (def.ground){ ground.material.roughness = W.wet ? .55 : .95; ground.material.color.set(def.ground).multiplyScalar(W.wet ? .7 : 1); }
 
     lamp.visible = c.street !== 'none';
     streetL.color.setRGB(...r.streetCol); streetL.intensity = r.streetI/.8*Math.PI*36;
@@ -858,7 +999,7 @@ function makeBench(key, init){
       half = (prep.box.max.x - prep.box.min.x)/2;
     }
     spots.forEach((s, i) => { s.position.z = half - .05; s.target.position.z = half + 11; });
-    grey.position.z = half + .75; ball.position.z = half + .45;
+    B.half = half; grey.position.z = half + .75; ball.position.z = half + .45;
     B.dirty = true;
   };
   B.syncUI();
@@ -870,6 +1011,17 @@ const DEF_A = {region:'kl', ...pick(REGIONS.kl), day:276, time:13, weather:'clea
 const DEF_B = {region:'rey', ...pick(REGIONS.rey), day:276, time:18.5, weather:'clear', heading:165, street:'none', head:'off'};
 function pick(R){ return {tz:R.tz, alt:R.alt, aod:R.aod, temp:R.temp, hum:R.hum, o3:R.o3}; }
 
+const sceneSel = document.getElementById('scene');
+sceneSel.innerHTML = Object.entries(SCENES).map(([k, d]) => `<option value="${k}">${d.n}</option>`).join('');
+function setScene(key, upd = true){ // both bays switch together: drop old props, rebuild, then re-bake the reflection environment
+  benches.forEach(b => b.clearScene());
+  sceneGeos.forEach(g => g.dispose()); sceneGeos = [];
+  const G = sceneGeometry(key);
+  benches.forEach(b => b.buildScene(key, G));
+  if (upd) benches.forEach(b => b.update());
+}
+sceneSel.addEventListener('change', () => setScene(sceneSel.value));
+
 let paintHex = PAINTS[0][1], finish = PAINTS[0][2];
 
 let compareQueued = false;
@@ -877,6 +1029,7 @@ function scheduleCompare(){ if (!compareQueued){ compareQueued = true; requestAn
 
 const A = makeBench('a', DEF_A), Bb = makeBench('b', DEF_B);
 const benches = [A, Bb];
+window.__bench = {benches, setScene}; // test hook
 
 function applyPaint(){
   const F = FIN[finish], look = paintLook(paintHex, finish);
@@ -979,6 +1132,7 @@ function setModel(key){
 }
 modelSel.addEventListener('change', () => setModel(modelSel.value));
 
+setScene(sceneSel.value, false);
 applyPaint();
 benches.forEach(b => b.update());
 setModel(modelSel.value);
