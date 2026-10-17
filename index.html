@@ -607,11 +607,11 @@ const MODELS = {
   muscle_sedan:      {n:'Muscle sedan',       file:'models/muscle_sedan.glb',      mb:15.9, front:-1},
   sports_coupe:      {n:'Sports coupe',       file:'models/sports_coupe.glb',      mb:6.8,  front:-1},
   audi_a8:           {n:'Audi A8',            file:'models/audi_a8.glb',           mb:3.0,  front:-1},
-  road_bike:         {n:'Road bike',          file:'models/road_bike.glb',         mb:15.4, front:-1},
+  road_bike:         {n:'Road bike',          file:'models/road_bike.glb',         mb:15.4, front:-1, wheelTop:.8},
   concept:           {n:'Concept (built-in)'},
 };
 const modelCache = {};
-function prepareModel(root){
+function prepareModel(root, wheelTop){
   root.updateMatrixWorld(true);
   // body paint = the opaque, non-glass, non-trim material covering the most surface (bare stainless bodies count as paintable)
   const area = new Map(), a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
@@ -639,7 +639,7 @@ function prepareModel(root){
   // glass, rubber and metal: swap in realistic materials (matched by name, transparency, or position on the wheels)
   const H = new THREE.Box3().setFromObject(root), hh = H.max.y - H.min.y, swap = new Map(), box = new THREE.Box3();
   const lumOf = m => .2126*m.color.r + .7152*m.color.g + .0722*m.color.b;
-  const meshes = []; root.traverse(o => { if (o.isMesh && !Array.isArray(o.material) && o.material !== paint){ box.setFromObject(o); o.userData.wheel = box.max.y - H.min.y < .5*hh && box.min.y - H.min.y < .12*hh; meshes.push(o); } });
+  const meshes = []; root.traverse(o => { if (o.isMesh && !Array.isArray(o.material) && o.material !== paint){ box.setFromObject(o); o.userData.wheel = box.max.y - H.min.y < (wheelTop ?? .5*hh) && box.min.y - H.min.y < .12*hh; meshes.push(o); } });
   const wheelOnly = new Map(); meshes.forEach(o => wheelOnly.set(o.material, (wheelOnly.get(o.material) ?? true) && o.userData.wheel));
   wheelOnly.forEach((wheel, m) => {
     const n = m.name || '', lum = lumOf(m);
@@ -660,6 +660,7 @@ function prepareModel(root){
     if (!(Array.isArray(o.material) ? o.material.includes(paint) : o.material === paint)) return;
     planarUV(o.geometry);
   });
+  bakeWheels(root);
   splitWheels(root);
   return {root, paint, box: new THREE.Box3().setFromObject(root)};
 }
@@ -687,6 +688,16 @@ function subGeo(g, tris, cx = 0, cy = 0){
     vs.forEach((v, i) => { for (let c = 0; c < S; c++) arr[i*S + c] = attrAt(a, v, c); }); o.setAttribute(name, new THREE.BufferAttribute(arr, S)); }
   o.setIndex(ni); o.translate(-cx, -cy, 0); o.computeBoundingSphere(); o.computeBoundingBox();
   return o;
+}
+/* exported models keep node offsets/rotations; bake each wheel mesh's transform into its geometry so splitWheels sees it at identity */
+function bakeWheels(root){
+  root.updateMatrixWorld(true); const inv = root.matrixWorld.clone().invert(), list = [];
+  root.traverse(o => { if (o.isMesh && o.userData.wheel && !Array.isArray(o.material)) list.push(o); });
+  list.forEach(o => {
+    if (o.parent === root && o.position.lengthSq() === 0 && o.quaternion.w === 1 && o.scale.x === 1 && o.scale.y === 1 && o.scale.z === 1) return;
+    o.geometry = o.geometry.clone().applyMatrix4(inv.clone().multiply(o.matrixWorld));
+    o.position.set(0, 0, 0); o.quaternion.identity(); o.scale.set(1, 1, 1); root.add(o);
+  });
 }
 function splitWheels(root){
   const parts = [], wheels = [];
@@ -722,13 +733,13 @@ function loadModel(key, onProgress){
   const M = MODELS[key];
   // .glb loads directly; .b64.txt is the same model as base64 text (for hosts that only serve text)
   if (!modelCache[key] && /\.glb$/i.test(M.file)) modelCache[key] = new Promise((res, rej) =>
-    new GLTFLoader().load(M.file, g => res(prepareModel(g.scene)), onProgress, rej));
+    new GLTFLoader().load(M.file, g => res(prepareModel(g.scene, M.wheelTop)), onProgress, rej));
   if (!modelCache[key]) modelCache[key] = new Promise((res, rej) => {
     const fl = new THREE.FileLoader(); fl.setResponseType('text');
     fl.load(M.file, txt => {
       const bin = atob(txt.replace(/\s+/g, '')), buf = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-      new GLTFLoader().parse(buf.buffer, '', g => res(prepareModel(g.scene)), rej);
+      new GLTFLoader().parse(buf.buffer, '', g => res(prepareModel(g.scene, M.wheelTop)), rej);
     }, onProgress, rej);
   });
   return modelCache[key];
@@ -1225,6 +1236,7 @@ function setModel(key){
       loadState.textContent = prep.paint ? '' : 'No body panel found to repaint'; })
     .catch(() => { if (req === modelReq){ delete modelCache[key]; loadState.textContent = `Could not load ${M.n}. Pick it again to retry.`; } });
 }
+modelSel.value = 'muscle_sedan'; // default model
 modelSel.addEventListener('change', () => setModel(modelSel.value));
 
 setScene(sceneSel.value, false);
