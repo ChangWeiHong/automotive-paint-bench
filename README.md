@@ -66,6 +66,7 @@ Open http://127.0.0.1:8080. Browsers block model loads from `file://`, so you ne
 | Compact hatchback | awantech `compact-hatchback/GLB/` | yes |
 | Sedan, Cybertruck | exported from STEP in `automotive-cad-model-preview/models/STEP/` with `cadgen glb build` | yes |
 | Angular pickup | awantech `text-to-cad.ready/models/angular_pickup/GLB/` | yes |
+| Audi RS8, Muscle sedan, Sports coupe | Blender files exported with the glTF 2.0 exporter (subdivision capped, textures at most 1024 px, ground plane removed) | not checked |
 | Smart fortwo | awantech `text-to-cad.ready/models/smart_fortwo/GLB/` | no, its wheels are fused into the body mesh |
 | Concept | built into the page | yes |
 
