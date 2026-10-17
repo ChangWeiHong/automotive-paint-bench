@@ -611,7 +611,7 @@ const MODELS = {
   concept:           {n:'Concept (built-in)'},
 };
 const modelCache = {};
-function prepareModel(root, wheelTop){
+function prepareModel(root, wheelTop, front){
   root.updateMatrixWorld(true);
   // body paint = the opaque, non-glass, non-trim material covering the most surface (bare stainless bodies count as paintable)
   const area = new Map(), a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
@@ -652,6 +652,24 @@ function prepareModel(root, wheelTop){
     } else if (/rubber|tyre|tire/i.test(n) || wheel && lum < .03) swap.set(m, rubberize(m));
     else if (/chrome/i.test(n)){ m.metalness = 1; m.roughness = Math.min(m.roughness, .06); }
     else if (/rim|alloy|wheel/i.test(n) || wheel && lum >= .03){ m.metalness = 1; m.roughness = Math.min(m.roughness, .25); }
+  });
+  // lamps (named lamp/lens/light/neon, or exported with a glow): tag front/rear by position along the length (X); the bench drives their glow from the headlight setting
+  const lit = m => m.emissive && m.emissiveIntensity > 0 && m.emissive.r + m.emissive.g + m.emissive.b > 0;
+  const ctrX = (H.min.x + H.max.x)/2, len = H.max.x - H.min.x;
+  meshes.forEach(o => {
+    const m0 = o.material; if (!(/lamp|lens|light|neon/i.test(m0.name || '') && !/glass/i.test(m0.name || '') || lit(m0))) return;
+    box.setFromObject(o); const x = (box.min.x + box.max.x)/2 - ctrX;
+    if (Math.abs(x) > .25*len) o.userData.lamp = x*front > 0 ? 'head' : 'tail';
+    if (lit(m0)) m0.emissiveIntensity = 0; // baked glow stays off until the bench lights it
+  });
+  // exported lenses can lose their transmission and turn into opaque smooth shells over the bulb: a smooth non-metal shell wrapping a lamp glows with it
+  const lampBoxes = meshes.filter(o => o.userData.lamp).map(o => ({side: o.userData.lamp, b: new THREE.Box3().setFromObject(o)}));
+  meshes.forEach(o => {
+    const m = o.material; if (o.userData.lamp || o.userData.wheel || m.roughness > .15 || m.metalness > .5) return;
+    box.setFromObject(o); const s = box.getSize(new THREE.Vector3());
+    const L = lampBoxes.find(({b}) => { const e = b.clone().expandByScalar(.03), t = b.getSize(new THREE.Vector3());
+      return e.containsBox(box) || box.clone().expandByScalar(.03).containsBox(b) && s.x < t.x*1.5 + .1 && s.y < t.y*1.5 + .1 && s.z < t.z*1.5 + .1; });
+    if (L) o.userData.lamp = L.side;
   });
   meshes.forEach(o => { const m = swap.get(o.material); if (m){ o.material = m; if (m.normalMap === TYRE) planarUV(o.geometry); } });
   // planar UVs in metres on painted meshes so flakes and orange peel have a scale
@@ -733,13 +751,13 @@ function loadModel(key, onProgress){
   const M = MODELS[key];
   // .glb loads directly; .b64.txt is the same model as base64 text (for hosts that only serve text)
   if (!modelCache[key] && /\.glb$/i.test(M.file)) modelCache[key] = new Promise((res, rej) =>
-    new GLTFLoader().load(M.file, g => res(prepareModel(g.scene, M.wheelTop)), onProgress, rej));
+    new GLTFLoader().load(M.file, g => res(prepareModel(g.scene, M.wheelTop, M.front)), onProgress, rej));
   if (!modelCache[key]) modelCache[key] = new Promise((res, rej) => {
     const fl = new THREE.FileLoader(); fl.setResponseType('text');
     fl.load(M.file, txt => {
       const bin = atob(txt.replace(/\s+/g, '')), buf = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-      new GLTFLoader().parse(buf.buffer, '', g => res(prepareModel(g.scene, M.wheelTop)), rej);
+      new GLTFLoader().parse(buf.buffer, '', g => res(prepareModel(g.scene, M.wheelTop, M.front)), rej);
     }, onProgress, rej);
   });
   return modelCache[key];
@@ -940,7 +958,7 @@ function makeBench(key, init){
   const paint = makePaint();
   const {car, lens, drl, spots, wheels: carWheels} = buildCar(paint);
   const holder = new THREE.Group(); holder.add(car); scene.add(holder);
-  let imported = null;
+  let imported = null, lampMats = {head:[], tail:[]};
 
   const ground = new THREE.Mesh(new THREE.CircleGeometry(400, 72), new THREE.MeshStandardMaterial({roughness:.92}));
   ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
@@ -1019,15 +1037,10 @@ function makeBench(key, init){
     streetL.color.setRGB(...r.streetCol); streetL.intensity = B.streetBase = r.streetI/.8*Math.PI*36;
     headMat.emissive.setRGB(...r.streetCol); headMat.emissiveIntensity = r.streetI*600;
 
-    const H = HEAD[c.head];
-    const hc = H.spec ? lightColor(H.spec) : [1,1,1];
-    const hm = Math.max(...hc);
-    lens.emissive.setRGB(...hc.map(v => v/hm)); lens.emissiveIntensity = H.spec ? 1.6 : 0;
-    drl.emissive.setRGB(...hc.map(v => v/hm)); drl.emissiveIntensity = H.spec ? 1.2 : .05;
-    spots.forEach(s => { s.color.setRGB(...hc); s.intensity = H.spec ? 3*250/110000*6*Math.PI*32 : 0; });
 
     const expo = document.getElementById('expo').value === 'adapt' ? clamp(.85/Math.pow(Math.max(r.rel,1e-9), .75), .4, 4000) : .85;
     renderer.toneMappingExposure = expo; sky.material.uniforms.exposure.value = expo;
+    B.lamps();
 
     // readouts
     const st = k => el.querySelector(`[data-s="${k}"]`);
@@ -1071,9 +1084,22 @@ function makeBench(key, init){
     else streetL.intensity = B.streetBase;
     B.dirty = true;
   };
+  // headlights: concept lenses/DRLs, an imported model's own head and tail lamps, and the two beams
+  B.lamps = () => {
+    const H = HEAD[c.head];
+    const hc = H.spec ? lightColor(H.spec) : [1,1,1];
+    const hm = Math.max(...hc);
+    lens.emissive.setRGB(...hc.map(v => v/hm)); lens.emissiveIntensity = H.spec ? 1.6 : 0;
+    drl.emissive.setRGB(...hc.map(v => v/hm)); drl.emissiveIntensity = H.spec ? 1.2 : .05;
+    lampMats.head.forEach(m => { m.emissive.setRGB(...hc.map(v => v/hm)); m.emissiveIntensity = H.spec ? 1.6 : 0; });
+    lampMats.tail.forEach(m => { m.emissive.setRGB(1, .02, .01); m.emissiveIntensity = H.spec ? Math.min(.8, 1.2/renderer.toneMappingExposure) : 0; }); // capped so the eye-adapted night exposure keeps them red, not blown white
+    spots.forEach(s => { s.color.setRGB(...hc); s.intensity = H.spec ? 3*250/110000*6*Math.PI*32 : 0; });
+    B.dirty = true;
+  };
   B.render = () => { if (B.dirty){ renderer.render(scene, camera); B.dirty = false; } };
   B.setModel = (prep, front) => {
-    if (imported){ holder.remove(imported); imported = null; }
+    if (imported){ holder.remove(imported); imported = null; lampMats.head.forEach(m => m.dispose()); lampMats.tail.forEach(m => m.dispose()); }
+    lampMats = {head:[], tail:[]};
     B.wheels = carWheels;
     car.children.forEach(o => { if (!o.isLight && !(o.isObject3D && spots.some(s => s.target === o))) o.visible = !prep; });
     let half = 2.35;
@@ -1086,10 +1112,23 @@ function makeBench(key, init){
       inner.position.set(-ctr.x, -prep.box.min.y, -ctr.z);
       imported = new THREE.Group(); imported.add(inner); B.base = imported.rotation.y = front > 0 ? -Math.PI/2 : Math.PI/2;
       B.wheels = []; inner.traverse(o => { if (o.userData.spin) B.wheels.push({o, r:o.userData.spin.r, axis:'z', s: front > 0 ? -1 : 1}); });
+      // lamp materials are shared between bays: clone them so each bay switches its own lights
+      const heads = new THREE.Box3(), bx = new THREE.Box3(), inv = new THREE.Matrix4(), mw = new THREE.Matrix4();
+      inner.updateMatrixWorld(true); inv.copy(inner.matrixWorld).invert();
+      inner.traverse(o => { if (!o.userData.lamp) return; o.material = o.material.clone(); lampMats[o.userData.lamp].push(o.material);
+        if (o.userData.lamp !== 'head') return;
+        if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+        heads.union(bx.copy(o.geometry.boundingBox).applyMatrix4(mw.multiplyMatrices(inv, o.matrixWorld))); });
       holder.add(imported);
       half = (prep.box.max.x - prep.box.min.x)/2;
-    }
+      if (!heads.isEmpty()){ // beams leave from the model's own headlamps (box in model space; car front = +z)
+        const c = heads.getCenter(new THREE.Vector3()).add(inner.position).applyAxisAngle(new THREE.Vector3(0,1,0), B.base);
+        const w = (heads.max.z - heads.min.z)*.35;
+        spots.forEach((s, i) => { const sd = i ? 1 : -1; s.position.set(c.x + sd*w, c.y, 0); s.target.position.set(c.x + sd*w*.6, 0, 0); });
+      } else spots.forEach((s, i) => { const sd = i ? 1 : -1; s.position.set(sd*.55, .66, 0); s.target.position.set(sd*.35, 0, 0); });
+    } else spots.forEach((s, i) => { const sd = i ? 1 : -1; s.position.set(sd*.55, .66, 0); s.target.position.set(sd*.35, 0, 0); });
     spots.forEach((s, i) => { s.position.z = half - .05; s.target.position.z = half + 11; });
+    if (B.res) B.lamps();
     B.half = half; grey.position.z = half + .75; ball.position.z = half + .45;
     B.dirty = true;
   };
